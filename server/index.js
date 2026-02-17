@@ -9,21 +9,15 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-// Serve static files
 app.use(express.static(path.join(__dirname, '..', 'public')));
-
 app.get('/', (req, res) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-// Хранилище игр
 const games = new Map();
-const playerSockets = new Map(); // ws -> { playerId, roomId }
+const playerSockets = new Map();
 
 function broadcast(roomId, message) {
-  const game = games.get(roomId);
-  if (!game) return;
-
   wss.clients.forEach(client => {
     const info = playerSockets.get(client);
     if (info && info.roomId === roomId && client.readyState === WebSocket.OPEN) {
@@ -33,25 +27,7 @@ function broadcast(roomId, message) {
 }
 
 function sendTo(ws, message) {
-  if (ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(message));
-  }
-}
-
-function sendGameState(roomId) {
-  const game = games.get(roomId);
-  if (!game) return;
-
-  wss.clients.forEach(client => {
-    const info = playerSockets.get(client);
-    if (info && info.roomId === roomId && client.readyState === WebSocket.OPEN) {
-      sendTo(client, {
-        type: 'gameState',
-        state: game.getState(),
-        yourId: info.playerId
-      });
-    }
-  });
+  if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
 }
 
 wss.on('connection', (ws) => {
@@ -59,61 +35,54 @@ wss.on('connection', (ws) => {
 
   ws.on('message', (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data);
-    } catch (e) {
-      return;
-    }
+    try { msg = JSON.parse(data); } catch (e) { return; }
 
     switch (msg.type) {
       case 'createRoom': {
         const roomId = uuidv4().substring(0, 6).toUpperCase();
         const playerId = uuidv4();
-        const game = new Game(roomId);
+        const maxPlayers = Math.min(Math.max(parseInt(msg.maxPlayers) || 2, 2), 3);
+        const game = new Game(roomId, maxPlayers);
         game.addPlayer(playerId, msg.name || 'Игрок 1');
         games.set(roomId, game);
         playerSockets.set(ws, { playerId, roomId });
-
-        sendTo(ws, {
-          type: 'roomCreated',
-          roomId,
-          playerId,
-          state: game.getState()
-        });
-        console.log(`Room created: ${roomId} by ${msg.name}`);
+        sendTo(ws, { type: 'roomCreated', roomId, playerId, state: game.getState() });
         break;
       }
 
       case 'joinRoom': {
         const roomId = msg.roomId?.toUpperCase();
         const game = games.get(roomId);
-        if (!game) {
-          sendTo(ws, { type: 'error', text: 'Комната не найдена' });
-          return;
-        }
-        if (game.players.length >= 2) {
-          sendTo(ws, { type: 'error', text: 'Комната полна' });
-          return;
-        }
+        if (!game) { sendTo(ws, { type: 'error', text: 'Комната не найдена' }); return; }
+        if (game.players.length >= game.maxPlayers) { sendTo(ws, { type: 'error', text: 'Комната полна' }); return; }
+        if (game.started) { sendTo(ws, { type: 'error', text: 'Игра уже идёт' }); return; }
 
         const playerId = uuidv4();
-        game.addPlayer(playerId, msg.name || 'Игрок 2');
-        game.started = true;
+        game.addPlayer(playerId, msg.name || `Игрок ${game.players.length}`);
         playerSockets.set(ws, { playerId, roomId });
 
-        sendTo(ws, {
-          type: 'roomJoined',
-          roomId,
-          playerId,
-          state: game.getState()
-        });
+        sendTo(ws, { type: 'roomJoined', roomId, playerId, state: game.getState() });
 
-        broadcast(roomId, {
-          type: 'gameStarted',
-          state: game.getState()
-        });
+        // Если набрано нужное кол-во — старт
+        if (game.players.length >= game.maxPlayers) {
+          game.started = true;
+          broadcast(roomId, { type: 'gameStarted', state: game.getState() });
+        } else {
+          broadcast(roomId, { type: 'playerJoined', state: game.getState() });
+        }
+        break;
+      }
 
-        console.log(`${msg.name} joined room ${roomId}`);
+      case 'startEarly': {
+        const info = playerSockets.get(ws);
+        if (!info) return;
+        const game = games.get(info.roomId);
+        if (!game || game.started) return;
+        if (game.players.length < 2) { sendTo(ws, { type: 'error', text: 'Минимум 2 игрока' }); return; }
+        // Только создатель может стартовать раньше
+        if (game.players[0].id !== info.playerId) { sendTo(ws, { type: 'error', text: 'Только создатель может начать' }); return; }
+        game.started = true;
+        broadcast(info.roomId, { type: 'gameStarted', state: game.getState() });
         break;
       }
 
@@ -122,18 +91,9 @@ wss.on('connection', (ws) => {
         if (!info) return;
         const game = games.get(info.roomId);
         if (!game || !game.started || game.gameOver) return;
-
         const result = game.processTurn(info.playerId);
-        if (result.error) {
-          sendTo(ws, { type: 'error', text: result.error });
-          return;
-        }
-
-        broadcast(info.roomId, {
-          type: 'turnResult',
-          events: result.events,
-          state: game.getState()
-        });
+        if (result.error) { sendTo(ws, { type: 'error', text: result.error }); return; }
+        broadcast(info.roomId, { type: 'turnResult', events: result.events, state: game.getState() });
         break;
       }
 
@@ -142,18 +102,9 @@ wss.on('connection', (ws) => {
         if (!info) return;
         const game = games.get(info.roomId);
         if (!game) return;
-
         const result = game.buyProperty(info.playerId, msg.cellId);
-        if (result.error) {
-          sendTo(ws, { type: 'error', text: result.error });
-          return;
-        }
-
-        broadcast(info.roomId, {
-          type: 'turnResult',
-          events: result.events,
-          state: game.getState()
-        });
+        if (result.error) { sendTo(ws, { type: 'error', text: result.error }); return; }
+        broadcast(info.roomId, { type: 'turnResult', events: result.events, state: game.getState() });
         break;
       }
 
@@ -162,18 +113,9 @@ wss.on('connection', (ws) => {
         if (!info) return;
         const game = games.get(info.roomId);
         if (!game) return;
-
         const result = game.passProperty(info.playerId);
-        if (result.error) {
-          sendTo(ws, { type: 'error', text: result.error });
-          return;
-        }
-
-        broadcast(info.roomId, {
-          type: 'turnResult',
-          events: result.events,
-          state: game.getState()
-        });
+        if (result.error) { sendTo(ws, { type: 'error', text: result.error }); return; }
+        broadcast(info.roomId, { type: 'turnResult', events: result.events, state: game.getState() });
         break;
       }
 
@@ -182,18 +124,9 @@ wss.on('connection', (ws) => {
         if (!info) return;
         const game = games.get(info.roomId);
         if (!game) return;
-
         const result = game.buyHouse(info.playerId, msg.cellId);
-        if (result.error) {
-          sendTo(ws, { type: 'error', text: result.error });
-          return;
-        }
-
-        broadcast(info.roomId, {
-          type: 'turnResult',
-          events: result.events,
-          state: game.getState()
-        });
+        if (result.error) { sendTo(ws, { type: 'error', text: result.error }); return; }
+        broadcast(info.roomId, { type: 'turnResult', events: result.events, state: game.getState() });
         break;
       }
 
@@ -202,20 +135,20 @@ wss.on('connection', (ws) => {
         if (!info) return;
         const game = games.get(info.roomId);
         if (!game) return;
-
         const result = game.payJailFine(info.playerId);
-        if (result.error) {
-          sendTo(ws, { type: 'error', text: result.error });
-          return;
-        }
+        if (result.error) { sendTo(ws, { type: 'error', text: result.error }); return; }
+        broadcast(info.roomId, { type: 'turnResult', events: result.events, state: game.getState() });
+        break;
+      }
 
-        broadcast(info.roomId, {
-          type: 'turnResult',
-          events: result.events,
-          state: game.getState()
-        });
-
-        sendGameState(info.roomId);
+      case 'surrender': {
+        const info = playerSockets.get(ws);
+        if (!info) return;
+        const game = games.get(info.roomId);
+        if (!game || !game.started) return;
+        const result = game.surrender(info.playerId);
+        if (result.error) { sendTo(ws, { type: 'error', text: result.error }); return; }
+        broadcast(info.roomId, { type: 'turnResult', events: result.events, state: game.getState() });
         break;
       }
     }
@@ -224,23 +157,25 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const info = playerSockets.get(ws);
     if (info) {
-      const game = games.get(info.roomId);
-      if (game) {
-        broadcast(info.roomId, {
-          type: 'playerDisconnected',
-          text: 'Соперник отключился'
-        });
-        // Удаляем комнату через некоторое время
-        setTimeout(() => {
-          games.delete(info.roomId);
-        }, 60000);
-      }
+      broadcast(info.roomId, { type: 'playerDisconnected', text: 'Игрок отключился' });
+      setTimeout(() => {
+        const game = games.get(info.roomId);
+        if (game) {
+          const allDisconnected = game.players.every(p => {
+            let found = false;
+            wss.clients.forEach(c => {
+              const ci = playerSockets.get(c);
+              if (ci && ci.playerId === p.id && c.readyState === WebSocket.OPEN) found = true;
+            });
+            return !found;
+          });
+          if (allDisconnected) games.delete(info.roomId);
+        }
+      }, 120000);
       playerSockets.delete(ws);
     }
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Monopoly server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Monopoly server on port ${PORT}`));
