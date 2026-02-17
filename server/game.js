@@ -17,6 +17,7 @@ class Game {
     this.chestCards = this.shuffle([...CHEST_CARDS]);
     this.chanceIndex = 0;
     this.chestIndex = 0;
+    this.turnPhase = 'roll'; // 'roll' | 'action' | 'done'
   }
 
   shuffle(arr) {
@@ -46,15 +47,12 @@ class Game {
     return true;
   }
 
-  removePlayer(id) {
-    this.players = this.players.filter(p => p.id !== id);
-  }
-
   getPlayer(id) {
     return this.players.find(p => p.id === id);
   }
 
   getCurrentPlayer() {
+    if (this.players.length === 0) return null;
     return this.players[this.currentPlayerIndex];
   }
 
@@ -76,50 +74,91 @@ class Game {
   nextTurn() {
     this.doublesCount = 0;
     this.awaitingAction = null;
+    this.turnPhase = 'roll';
     const active = this.getActivePlayers();
     if (active.length <= 1) {
       this.gameOver = true;
       this.winner = active[0] || null;
       return;
     }
+    // Переключаем на следующего активного
+    let safety = 0;
     do {
       this.currentPlayerIndex = (this.currentPlayerIndex + 1) % this.players.length;
-    } while (this.players[this.currentPlayerIndex].bankrupt);
+      safety++;
+    } while (this.players[this.currentPlayerIndex].bankrupt && safety < this.players.length + 1);
+  }
+
+  // Принудительная разблокировка хода если что-то зависло
+  forceUnlock(playerId) {
+    const player = this.getCurrentPlayer();
+    if (!player || player.id !== playerId) return { error: "Не ваш ход" };
+
+    // Сбрасываем любое ожидание
+    this.awaitingAction = null;
+    this.turnPhase = 'roll';
+
+    // Если был дубль — отменяем бонусный ход, просто следующий
+    this.doublesCount = 0;
+    this.nextTurn();
+
+    return {
+      events: [{ type: 'message', text: `${player.name} пропустил ход (сброс)` }]
+    };
   }
 
   processTurn(playerId) {
     const player = this.getCurrentPlayer();
     if (!player || player.id !== playerId) return { error: "Не ваш ход" };
-    if (this.awaitingAction) return { error: "Сначала выполните действие" };
     if (player.bankrupt) return { error: "Вы банкрот" };
+
+    // Если ожидается действие (купить/пропустить) — нельзя кидать
+    if (this.awaitingAction) {
+      return { error: "Сначала купите или пропустите" };
+    }
+
+    // Проверяем фазу хода
+    if (this.turnPhase !== 'roll') {
+      return { error: "Вы уже бросали кубики" };
+    }
 
     const events = [];
 
+    // === ТЮРЬМА ===
     if (player.inJail) {
       const [d1, d2] = this.rollDice();
       events.push({ type: 'dice', values: [d1, d2], player: player.name });
+
       if (d1 === d2) {
         player.inJail = false;
         player.jailTurns = 0;
-        events.push({ type: 'message', text: `${player.name} выбросил дубль и вышел из тюрьмы!` });
+        events.push({ type: 'message', text: `${player.name} выбросил дубль и вышел!` });
         events.push(...this.movePlayer(player, d1 + d2));
+        // После выхода из тюрьмы дублем — НЕ даём ещё ход
+        if (!this.awaitingAction) {
+          this.nextTurn();
+        }
       } else {
         player.jailTurns++;
         if (player.jailTurns >= 3) {
           player.inJail = false;
           player.jailTurns = 0;
           player.money -= 50;
-          events.push({ type: 'message', text: `${player.name} заплатил 50$ и вышел из тюрьмы` });
+          events.push({ type: 'message', text: `${player.name} заплатил 50$ — свобода!` });
           events.push(...this.movePlayer(player, d1 + d2));
+          if (!this.awaitingAction) {
+            this.nextTurn();
+          }
         } else {
-          events.push({ type: 'message', text: `${player.name} в тюрьме (попытка ${player.jailTurns}/3)` });
+          events.push({ type: 'message', text: `${player.name} в тюрьме (${player.jailTurns}/3)` });
+          this.nextTurn();
         }
       }
-      if (!this.awaitingAction) this.nextTurn();
       this.checkBankruptcy();
       return { events };
     }
 
+    // === ОБЫЧНЫЙ ХОД ===
     const [d1, d2] = this.rollDice();
     events.push({ type: 'dice', values: [d1, d2], player: player.name });
 
@@ -128,7 +167,7 @@ class Game {
       if (this.doublesCount >= 3) {
         player.position = 10;
         player.inJail = true;
-        events.push({ type: 'message', text: `${player.name} — 3 дубля подряд — в тюрьму!` });
+        events.push({ type: 'message', text: `${player.name} — 3 дубля — в тюрьму!` });
         events.push({ type: 'move', playerId: player.id, position: 10 });
         this.nextTurn();
         return { events };
@@ -137,12 +176,17 @@ class Game {
 
     events.push(...this.movePlayer(player, d1 + d2));
 
-    if (!this.awaitingAction) {
-      if (this.isDoubles()) {
-        events.push({ type: 'message', text: `${player.name} выбросил дубль! Ещё ход.` });
-      } else {
-        this.nextTurn();
-      }
+    // Решаем что дальше
+    if (this.awaitingAction) {
+      // Ждём купить/пропустить — turnPhase = 'action'
+      this.turnPhase = 'action';
+    } else if (this.isDoubles()) {
+      // Дубль — ещё бросок
+      this.turnPhase = 'roll';
+      events.push({ type: 'message', text: `${player.name} дубль! Ещё бросок.` });
+    } else {
+      // Обычный конец хода
+      this.nextTurn();
     }
 
     this.checkBankruptcy();
@@ -170,6 +214,7 @@ class Game {
         player.money += 200;
         events.push({ type: 'message', text: `${player.name} на СТАРТЕ! +200$` });
         break;
+
       case 'property':
       case 'railroad':
       case 'utility': {
@@ -185,16 +230,18 @@ class Game {
           const rent = this.calculateRent(cell, owner);
           player.money -= rent;
           owner.money += rent;
-          events.push({ type: 'rent', text: `${player.name} платит ${rent}$ ренты ${owner.name} за "${cell.name}"`, from: player.id, to: owner.id, amount: rent });
+          events.push({ type: 'rent', text: `${player.name} платит ${rent}$ → ${owner.name} за "${cell.name}"` });
         } else if (owner.id === player.id) {
-          events.push({ type: 'message', text: `${player.name} на своём участке "${cell.name}"` });
+          events.push({ type: 'message', text: `${player.name} на своём "${cell.name}"` });
         }
         break;
       }
+
       case 'tax':
         player.money -= cell.amount;
-        events.push({ type: 'message', text: `${player.name} платит налог ${cell.amount}$` });
+        events.push({ type: 'message', text: `${player.name} налог ${cell.amount}$` });
         break;
+
       case 'chance': {
         const card = this.chanceCards[this.chanceIndex];
         this.chanceIndex = (this.chanceIndex + 1) % this.chanceCards.length;
@@ -202,6 +249,7 @@ class Game {
         events.push(...this.applyCard(player, card));
         break;
       }
+
       case 'chest': {
         const card = this.chestCards[this.chestIndex];
         this.chestIndex = (this.chestIndex + 1) % this.chestCards.length;
@@ -209,15 +257,18 @@ class Game {
         events.push(...this.applyCard(player, card));
         break;
       }
+
       case 'gotojail':
         player.position = 10;
         player.inJail = true;
         events.push({ type: 'message', text: `${player.name} в тюрьму!` });
         events.push({ type: 'move', playerId: player.id, position: 10 });
         break;
+
       case 'jail':
         events.push({ type: 'message', text: `${player.name} навещает тюрьму` });
         break;
+
       case 'parking':
         events.push({ type: 'message', text: `${player.name} на парковке` });
         break;
@@ -238,7 +289,7 @@ class Game {
         break;
       case 'goto': {
         const oldPos = player.position;
-        if (card.value < oldPos) {
+        if (card.value <= oldPos) {
           player.money += 200;
           events.push({ type: 'message', text: `${player.name} прошёл СТАРТ +200$` });
         }
@@ -253,17 +304,18 @@ class Game {
         events.push({ type: 'message', text: `${player.name} в тюрьму!` });
         events.push({ type: 'move', playerId: player.id, position: 10 });
         break;
-      case 'back':
+      case 'back': {
         player.position = (player.position - card.value + 40) % 40;
         events.push({ type: 'move', playerId: player.id, position: player.position });
         events.push(...this.landOnCell(player, this.board[player.position]));
         break;
+      }
       case 'birthday':
         this.players.forEach(p => {
           if (p.id !== player.id && !p.bankrupt) {
             p.money -= card.value;
             player.money += card.value;
-            events.push({ type: 'message', text: `${p.name} дарит ${card.value}$ ${player.name}` });
+            events.push({ type: 'message', text: `${p.name} → ${card.value}$ → ${player.name}` });
           }
         });
         break;
@@ -272,13 +324,13 @@ class Game {
   }
 
   getPropertyOwner(cellId) {
-    return this.players.find(p => p.properties.includes(cellId)) || null;
+    return this.players.find(p => p.properties.includes(cellId) && !p.bankrupt) || null;
   }
 
   calculateRent(cell, owner) {
     if (cell.type === 'railroad') {
       const count = owner.properties.filter(id => this.board[id].type === 'railroad').length;
-      return cell.rent[count - 1];
+      return cell.rent[Math.min(count, 4) - 1];
     }
     if (cell.type === 'utility') {
       const count = owner.properties.filter(id => this.board[id].type === 'utility').length;
@@ -291,7 +343,7 @@ class Game {
       if (group && group.every(id => owner.properties.includes(id))) return cell.rent[0] * 2;
       return cell.rent[0];
     }
-    return cell.rent[houses];
+    return cell.rent[Math.min(houses, 5)];
   }
 
   buyProperty(playerId, cellId) {
@@ -300,11 +352,21 @@ class Game {
     if (!this.awaitingAction || this.awaitingAction.cellId !== cellId) return { error: "Нельзя купить" };
     const cell = this.board[cellId];
     if (player.money < cell.price) return { error: "Нет денег" };
+
     player.money -= cell.price;
     player.properties.push(cellId);
     const events = [{ type: 'buy', text: `${player.name} купил "${cell.name}" за ${cell.price}$`, playerId, cellId }];
+
     this.awaitingAction = null;
-    if (!this.isDoubles()) this.nextTurn();
+
+    // После покупки — проверяем был ли дубль
+    if (this.isDoubles() && this.doublesCount < 3) {
+      this.turnPhase = 'roll';
+      events.push({ type: 'message', text: `${player.name} дубль! Ещё бросок.` });
+    } else {
+      this.nextTurn();
+    }
+
     this.checkBankruptcy();
     return { events };
   }
@@ -313,10 +375,19 @@ class Game {
     const player = this.getCurrentPlayer();
     if (!player || player.id !== playerId) return { error: "Не ваш ход" };
     if (!this.awaitingAction) return { error: "Нечего пропускать" };
+
     const cell = this.board[this.awaitingAction.cellId];
     const events = [{ type: 'message', text: `${player.name} отказался от "${cell.name}"` }];
+
     this.awaitingAction = null;
-    if (!this.isDoubles()) this.nextTurn();
+
+    if (this.isDoubles() && this.doublesCount < 3) {
+      this.turnPhase = 'roll';
+      events.push({ type: 'message', text: `${player.name} дубль! Ещё бросок.` });
+    } else {
+      this.nextTurn();
+    }
+
     return { events };
   }
 
@@ -347,18 +418,19 @@ class Game {
     player.money -= 50;
     player.inJail = false;
     player.jailTurns = 0;
+    // После оплаты — можно бросать кубики
+    this.turnPhase = 'roll';
     return { events: [{ type: 'message', text: `${player.name} заплатил 50$ — свобода!` }] };
   }
 
   surrender(playerId) {
     const player = this.getPlayer(playerId);
-    if (!player) return { error: "Игрок не найден" };
+    if (!player || player.bankrupt) return { error: "Нельзя" };
     player.bankrupt = true;
     player.properties = [];
     player.houses = {};
-    const events = [{ type: 'message', text: `${player.name} сдался!` }];
+    const events = [{ type: 'message', text: `🏳 ${player.name} сдался!` }];
 
-    // Если ожидалось действие от этого игрока
     if (this.awaitingAction && this.getCurrentPlayer()?.id === playerId) {
       this.awaitingAction = null;
     }
@@ -367,27 +439,32 @@ class Game {
     if (active.length <= 1) {
       this.gameOver = true;
       this.winner = active[0] || null;
-      events.push({ type: 'message', text: `${this.winner?.name || '???'} победил!` });
-    } else {
-      if (this.getCurrentPlayer()?.id === playerId) {
-        this.nextTurn();
-      }
+      if (this.winner) events.push({ type: 'message', text: `🏆 ${this.winner.name} победил!` });
+    } else if (this.getCurrentPlayer()?.id === playerId) {
+      this.nextTurn();
     }
     return { events };
   }
 
   checkBankruptcy() {
+    let changed = false;
     this.players.forEach(p => {
       if (p.money < 0 && !p.bankrupt) {
         p.bankrupt = true;
         p.properties = [];
         p.houses = {};
+        changed = true;
       }
     });
     const active = this.getActivePlayers();
     if (active.length <= 1 && this.started) {
       this.gameOver = true;
       this.winner = active[0] || null;
+    }
+    // Если текущий игрок стал банкротом — следующий
+    if (changed && this.getCurrentPlayer()?.bankrupt) {
+      this.awaitingAction = null;
+      this.nextTurn();
     }
   }
 
@@ -408,6 +485,7 @@ class Game {
       winner: this.winner ? { id: this.winner.id, name: this.winner.name } : null,
       lastDice: this.lastDice,
       awaitingAction: this.awaitingAction,
+      turnPhase: this.turnPhase,
       propertyGroups: PROPERTY_GROUPS
     };
   }
