@@ -1,7 +1,7 @@
 {
   "name": "monopoly-online",
-  "version": "1.0.0",
-  "description": "Monopoly online game for 2 players",
+  "version": "2.0.0",
+  "description": "Monopoly online game for 2-3 players",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
